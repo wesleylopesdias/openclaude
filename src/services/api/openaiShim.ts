@@ -634,6 +634,128 @@ function repairPossiblyTruncatedObjectJson(raw: string): string | null {
   }
 }
 
+function looksLikeTextToolCallCandidate(raw: string): boolean {
+  const trimmed = raw.trimStart()
+  return trimmed.startsWith('{') || trimmed.startsWith('<tool_call')
+}
+
+type ParsedTextToolCall = {
+  name: string
+  argumentsRaw: string
+}
+
+function resolveFallbackToolName(
+  rawToolName: unknown,
+  availableToolNames: Set<string>,
+): string | null {
+  if (typeof rawToolName !== 'string') return null
+
+  const trimmed = rawToolName.trim()
+  if (!trimmed) return null
+  if (availableToolNames.has(trimmed)) return trimmed
+
+  const normalized = trimmed.toLowerCase()
+  for (const toolName of availableToolNames) {
+    if (toolName.toLowerCase() === normalized) {
+      return toolName
+    }
+  }
+
+  for (const toolName of availableToolNames) {
+    const lowerToolName = toolName.toLowerCase()
+    if (
+      normalized.startsWith(`${lowerToolName} `) ||
+      normalized.startsWith(`${lowerToolName}:`) ||
+      normalized.startsWith(`${lowerToolName}(`)
+    ) {
+      return toolName
+    }
+  }
+
+  const firstToken = normalized.split(/[\s:(-]+/, 1)[0]
+  if (firstToken) {
+    for (const toolName of availableToolNames) {
+      if (toolName.toLowerCase() === firstToken) {
+        return toolName
+      }
+    }
+  }
+
+  return null
+}
+
+function parseTextToolCallFallback(
+  raw: string,
+  availableToolNames: Set<string>,
+): ParsedTextToolCall | null {
+  if (!raw || availableToolNames.size === 0) return null
+
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+
+  const candidates = [trimmed]
+  for (const match of trimmed.matchAll(/<tool_call>([\s\S]*?)<\/tool_call>/gi)) {
+    const inner = match[1]?.trim()
+    if (inner) candidates.push(inner)
+  }
+
+  const normalizeArgs = (value: unknown): string => {
+    if (typeof value === 'string') return value
+    if (value === undefined) return '{}'
+    return JSON.stringify(value)
+  }
+
+  for (const candidate of candidates) {
+    const stripped = candidate
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/i, '')
+      .trim()
+    if (!stripped) continue
+
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(stripped)
+    } catch {
+      continue
+    }
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      continue
+    }
+
+    const record = parsed as Record<string, unknown>
+    const resolvedTopLevelName = resolveFallbackToolName(
+      record.name,
+      availableToolNames,
+    )
+    if (resolvedTopLevelName) {
+      return {
+        name: resolvedTopLevelName,
+        argumentsRaw: normalizeArgs(record.arguments),
+      }
+    }
+
+    const fn = record.function
+    if (!fn || typeof fn !== 'object' || Array.isArray(fn)) {
+      continue
+    }
+
+    const functionRecord = fn as Record<string, unknown>
+    const resolvedNestedName = resolveFallbackToolName(
+      functionRecord.name,
+      availableToolNames,
+    )
+    if (resolvedNestedName) {
+      return {
+        name: resolvedNestedName,
+        argumentsRaw: normalizeArgs(functionRecord.arguments),
+      }
+    }
+  }
+
+  return null
+}
+
 /**
  * Async generator that transforms an OpenAI SSE stream into
  * Anthropic-format BetaRawMessageStreamEvent objects.
@@ -641,6 +763,7 @@ function repairPossiblyTruncatedObjectJson(raw: string): string | null {
 async function* openaiStreamToAnthropic(
   response: Response,
   model: string,
+  availableToolNames: Set<string>,
   signal?: AbortSignal,
 ): AsyncGenerator<AnthropicStreamEvent> {
   const messageId = makeMessageId()
@@ -663,6 +786,9 @@ async function* openaiStreamToAnthropic(
   let lastStopReason: 'tool_use' | 'max_tokens' | 'end_turn' | null = null
   let hasEmittedFinalUsage = false
   let hasProcessedFinishReason = false
+  let hasSeenExplicitToolCalls = false
+  let isBufferingTextToolCall = false
+  let bufferedTextToolCall = ''
 
   // Emit message_start
   yield {
@@ -807,6 +933,18 @@ async function* openaiStreamToAnthropic(
         // Text content — use != null to distinguish absent field from empty string,
         // some providers send "" as first delta to signal streaming start
         if (delta.content != null && delta.content !== '') {
+          if (
+            !hasSeenExplicitToolCalls &&
+            !hasEmittedContentStart &&
+            activeToolCalls.size === 0 &&
+            (isBufferingTextToolCall ||
+              looksLikeTextToolCallCandidate(bufferedTextToolCall + delta.content))
+          ) {
+            bufferedTextToolCall += delta.content
+            isBufferingTextToolCall = true
+            continue
+          }
+
           // Close thinking block if transitioning from reasoning to content
           if (hasEmittedThinkingStart && !hasClosedThinking) {
             yield { type: 'content_block_stop', index: contentBlockIndex }
@@ -860,6 +998,7 @@ async function* openaiStreamToAnthropic(
 
         // Tool calls
         if (delta.tool_calls) {
+          hasSeenExplicitToolCalls = true
           for (const tc of delta.tool_calls) {
             if (tc.id && tc.function?.name) {
               // New tool call starting — close any open thinking block first
@@ -943,6 +1082,56 @@ async function* openaiStreamToAnthropic(
         // multiple chunks arrive with finish_reason set (some providers do this)
         if (choice.finish_reason && !hasProcessedFinishReason) {
           hasProcessedFinishReason = true
+          let usedTextToolCallFallback = false
+
+          if (isBufferingTextToolCall && bufferedTextToolCall.trim()) {
+            const parsedFallbackToolCall = parseTextToolCallFallback(
+              bufferedTextToolCall,
+              availableToolNames,
+            )
+            if (parsedFallbackToolCall) {
+              const syntheticToolCallId = `call_${crypto.randomUUID().replace(/-/g, '')}`
+              const toolBlockIndex = contentBlockIndex
+              yield {
+                type: 'content_block_start',
+                index: toolBlockIndex,
+                content_block: {
+                  type: 'tool_use',
+                  id: syntheticToolCallId,
+                  name: parsedFallbackToolCall.name,
+                  input: {},
+                },
+              }
+              yield {
+                type: 'content_block_delta',
+                index: toolBlockIndex,
+                delta: {
+                  type: 'input_json_delta',
+                  partial_json: parsedFallbackToolCall.argumentsRaw,
+                },
+              }
+              yield { type: 'content_block_stop', index: toolBlockIndex }
+              contentBlockIndex++
+              usedTextToolCallFallback = true
+            } else {
+              if (!hasEmittedContentStart) {
+                yield {
+                  type: 'content_block_start',
+                  index: contentBlockIndex,
+                  content_block: { type: 'text', text: '' },
+                }
+                hasEmittedContentStart = true
+              }
+              yield {
+                type: 'content_block_delta',
+                index: contentBlockIndex,
+                delta: { type: 'text_delta', text: bufferedTextToolCall },
+              }
+            }
+
+            isBufferingTextToolCall = false
+            bufferedTextToolCall = ''
+          }
 
           // Close any open thinking block that wasn't closed by content transition
           if (hasEmittedThinkingStart && !hasClosedThinking) {
@@ -1018,7 +1207,7 @@ async function* openaiStreamToAnthropic(
           }
 
           const stopReason =
-            choice.finish_reason === 'tool_calls'
+            usedTextToolCallFallback || choice.finish_reason === 'tool_calls'
               ? 'tool_use'
               : choice.finish_reason === 'length'
                 ? 'max_tokens'
@@ -1116,13 +1305,23 @@ class OpenAIShimMessages {
       const request = resolveProviderRequest({ model: self.providerOverride?.model ?? params.model, baseUrl: self.providerOverride?.baseURL, reasoningEffortOverride: self.reasoningEffort })
       const response = await self._doRequest(request, params, options)
       httpResponse = response
+      const availableToolNames = new Set(
+        (params.tools as Array<{ name?: string }> | undefined)
+          ?.map(tool => tool?.name)
+          .filter((name): name is string => typeof name === 'string' && name.length > 0) ?? [],
+      )
 
       if (params.stream) {
         const isResponsesStream = response.url?.includes('/responses')
         return new OpenAIShimStream(
           (request.transport === 'codex_responses' || isResponsesStream)
             ? codexStreamToAnthropic(response, request.resolvedModel, options?.signal)
-            : openaiStreamToAnthropic(response, request.resolvedModel, options?.signal),
+            : openaiStreamToAnthropic(
+                response,
+                request.resolvedModel,
+                availableToolNames,
+                options?.signal,
+              ),
         )
       }
 
@@ -1149,14 +1348,14 @@ class OpenAIShimMessages {
               request.resolvedModel,
             )
           }
-          return self._convertNonStreamingResponse(parsed, request.resolvedModel)
+          return self._convertNonStreamingResponse(parsed, request.resolvedModel, availableToolNames)
         }
       }
 
       const contentType = response.headers.get('content-type') ?? ''
       if (contentType.includes('application/json')) {
         const data = await response.json()
-        return self._convertNonStreamingResponse(data, request.resolvedModel)
+        return self._convertNonStreamingResponse(data, request.resolvedModel, availableToolNames)
       }
 
       const textBody = await response.text().catch(() => '')
@@ -1570,6 +1769,7 @@ class OpenAIShimMessages {
       }
     },
     model: string,
+    availableToolNames: Set<string>,
   ) {
     const choice = data.choices?.[0]
     const content: Array<Record<string, unknown>> = []
@@ -1629,10 +1829,35 @@ class OpenAIShimMessages {
             : {}),
         })
       }
+    } else if (typeof rawContent === 'string') {
+      const parsedFallbackToolCall = parseTextToolCallFallback(
+        rawContent,
+        availableToolNames,
+      )
+      if (parsedFallbackToolCall) {
+        for (let i = content.length - 1; i >= 0; i--) {
+          if (content[i]?.type === 'text') {
+            content.splice(i, 1)
+            break
+          }
+        }
+
+        content.push({
+          type: 'tool_use',
+          id: `call_${crypto.randomUUID().replace(/-/g, '')}`,
+          name: parsedFallbackToolCall.name,
+          input: normalizeToolArguments(
+            parsedFallbackToolCall.name,
+            parsedFallbackToolCall.argumentsRaw,
+          ),
+        })
+      }
     }
 
     const stopReason =
-      choice?.finish_reason === 'tool_calls'
+      choice?.finish_reason === 'tool_calls' ||
+      (content.some(block => block.type === 'tool_use') &&
+        choice?.finish_reason !== 'length')
         ? 'tool_use'
         : choice?.finish_reason === 'length'
           ? 'max_tokens'

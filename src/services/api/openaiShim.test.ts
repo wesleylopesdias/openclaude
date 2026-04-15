@@ -1299,6 +1299,135 @@ test('keeps terminal empty Bash tool arguments invalid in non-streaming response
   ])
 })
 
+test('parses qwen-style text tool call fallback in non-streaming responses', async () => {
+  globalThis.fetch = (async (_input, _init) => {
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        model: 'qwen2.5-coder:14b',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: '{\n  "name": "Bash",\n  "arguments": {"command":"pwd"}\n}',
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 4,
+          total_tokens: 16,
+        },
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  const message = await client.beta.messages.create({
+    model: 'qwen2.5-coder:14b',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'Use Bash' }],
+    tools: [
+      {
+        name: 'Bash',
+        description: 'Run shell commands',
+        input_schema: {
+          type: 'object',
+          properties: {
+            command: { type: 'string' },
+          },
+          required: ['command'],
+          additionalProperties: false,
+        },
+      },
+    ],
+    max_tokens: 64,
+    stream: false,
+  }) as {
+    stop_reason?: string
+    content?: Array<Record<string, unknown>>
+  }
+
+  expect(message.stop_reason).toBe('tool_use')
+  expect(message.content?.length).toBe(1)
+  expect(message.content?.[0]).toMatchObject({
+    type: 'tool_use',
+    name: 'Bash',
+    input: { command: 'pwd' },
+  })
+})
+
+test('matches qwen-style text tool fallback when tool name includes trailing description', async () => {
+  globalThis.fetch = (async (_input, _init) => {
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        model: 'qwen2.5-coder:14b',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: '{"name":"Bash Run shell command","arguments":{"command":"pwd"}}',
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 4,
+          total_tokens: 16,
+        },
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  const message = await client.beta.messages.create({
+    model: 'qwen2.5-coder:14b',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'Use Bash' }],
+    tools: [
+      {
+        name: 'Bash',
+        description: 'Run shell command',
+        input_schema: {
+          type: 'object',
+          properties: {
+            command: { type: 'string' },
+          },
+          required: ['command'],
+          additionalProperties: false,
+        },
+      },
+    ],
+    max_tokens: 64,
+    stream: false,
+  }) as {
+    stop_reason?: string
+    content?: Array<Record<string, unknown>>
+  }
+
+  expect(message.stop_reason).toBe('tool_use')
+  expect(message.content?.[0]).toMatchObject({
+    type: 'tool_use',
+    name: 'Bash',
+    input: { command: 'pwd' },
+  })
+})
+
 test('normalizes plain string Bash tool arguments in streaming responses', async () => {
   globalThis.fetch = (async (_input, _init) => {
     const chunks = makeStreamChunks([
@@ -1373,6 +1502,203 @@ test('normalizes plain string Bash tool arguments in streaming responses', async
     .join('')
 
   expect(normalizedInput).toBe('{"command":"pwd"}')
+})
+
+test('parses qwen-style text tool call fallback in streaming responses', async () => {
+  globalThis.fetch = (async (_input, _init) => {
+    const chunks = makeStreamChunks([
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'qwen2.5-coder:14b',
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: 'assistant',
+              content: '{"name":"Bash","arguments":{"command":"',
+            },
+            finish_reason: null,
+          },
+        ],
+      },
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'qwen2.5-coder:14b',
+        choices: [
+          {
+            index: 0,
+            delta: {
+              content: 'pwd"}}',
+            },
+            finish_reason: null,
+          },
+        ],
+      },
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'qwen2.5-coder:14b',
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: 'stop',
+          },
+        ],
+      },
+    ])
+
+    return makeSseResponse(chunks)
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  const result = await client.beta.messages
+    .create({
+      model: 'qwen2.5-coder:14b',
+      system: 'test system',
+      messages: [{ role: 'user', content: 'Use Bash' }],
+      tools: [
+        {
+          name: 'Bash',
+          description: 'Run shell commands',
+          input_schema: {
+            type: 'object',
+            properties: {
+              command: { type: 'string' },
+            },
+            required: ['command'],
+            additionalProperties: false,
+          },
+        },
+      ],
+      max_tokens: 64,
+      stream: true,
+    })
+    .withResponse()
+
+  const events: Array<Record<string, unknown>> = []
+  for await (const event of result.data) {
+    events.push(event)
+  }
+
+  const toolStart = events.find(
+    event =>
+      event.type === 'content_block_start' &&
+      typeof event.content_block === 'object' &&
+      event.content_block !== null &&
+      (event.content_block as Record<string, unknown>).type === 'tool_use',
+  ) as { content_block?: Record<string, unknown> } | undefined
+
+  expect(toolStart?.content_block).toMatchObject({
+    type: 'tool_use',
+    name: 'Bash',
+  })
+
+  const normalizedInput = events
+    .filter(
+      event =>
+        event.type === 'content_block_delta' &&
+        typeof event.delta === 'object' &&
+        event.delta !== null &&
+        (event.delta as Record<string, unknown>).type === 'input_json_delta',
+    )
+    .map(event => (event.delta as Record<string, unknown>).partial_json)
+    .join('')
+
+  expect(normalizedInput).toBe('{"command":"pwd"}')
+
+  const stopReasonEvent = events.find(
+    event =>
+      event.type === 'message_delta' &&
+      typeof event.delta === 'object' &&
+      event.delta !== null &&
+      typeof (event.delta as Record<string, unknown>).stop_reason === 'string',
+  ) as { delta?: Record<string, unknown> } | undefined
+
+  expect(stopReasonEvent?.delta?.stop_reason).toBe('tool_use')
+})
+
+test('matches qwen-style streaming fallback when tool name includes trailing description', async () => {
+  globalThis.fetch = (async (_input, _init) => {
+    const chunks = makeStreamChunks([
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'qwen2.5-coder:14b',
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: 'assistant',
+              content: '{"name":"Bash Run shell command","arguments":{"command":"pwd"}}',
+            },
+            finish_reason: null,
+          },
+        ],
+      },
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'qwen2.5-coder:14b',
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: 'stop',
+          },
+        ],
+      },
+    ])
+
+    return makeSseResponse(chunks)
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  const result = await client.beta.messages
+    .create({
+      model: 'qwen2.5-coder:14b',
+      system: 'test system',
+      messages: [{ role: 'user', content: 'Use Bash' }],
+      tools: [
+        {
+          name: 'Bash',
+          description: 'Run shell command',
+          input_schema: {
+            type: 'object',
+            properties: {
+              command: { type: 'string' },
+            },
+            required: ['command'],
+            additionalProperties: false,
+          },
+        },
+      ],
+      max_tokens: 64,
+      stream: true,
+    })
+    .withResponse()
+
+  const events: Array<Record<string, unknown>> = []
+  for await (const event of result.data) {
+    events.push(event)
+  }
+
+  const toolStart = events.find(
+    event =>
+      event.type === 'content_block_start' &&
+      typeof event.content_block === 'object' &&
+      event.content_block !== null &&
+      (event.content_block as Record<string, unknown>).type === 'tool_use',
+  ) as { content_block?: Record<string, unknown> } | undefined
+
+  expect(toolStart?.content_block).toMatchObject({
+    type: 'tool_use',
+    name: 'Bash',
+  })
 })
 
 test('normalizes plain string Bash tool arguments when streaming starts with an empty chunk', async () => {

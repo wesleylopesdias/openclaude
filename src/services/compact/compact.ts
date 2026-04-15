@@ -120,6 +120,7 @@ import {
   getCompactPrompt,
   getCompactUserSummaryMessage,
   getPartialCompactPrompt,
+  looksLikeCompactPromptEcho,
 } from './prompt.js'
 
 export const POST_COMPACT_MAX_FILES_TO_RESTORE = 5
@@ -1209,7 +1210,28 @@ async function streamCompactSummary({
         // messages. Without this check, an aborted compact "succeeds" with
         // "Request was aborted." as the summary — the text doesn't start with
         // "API Error" so the caller's startsWithApiErrorPrefix guard misses it.
-        if (assistantMsg && assistantText && !assistantMsg.isApiErrorMessage) {
+        if (
+          assistantMsg &&
+          assistantText &&
+          !assistantMsg.isApiErrorMessage &&
+          looksLikeCompactPromptEcho(assistantText)
+        ) {
+          logForDebugging(
+            'Compact cache sharing returned prompt echo, falling back to streaming.',
+            { level: 'warn' },
+          )
+          logEvent('tengu_compact_cache_sharing_fallback', {
+            reason:
+              'prompt_echo' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+            preCompactTokenCount,
+          })
+        }
+        if (
+          assistantMsg &&
+          assistantText &&
+          !assistantMsg.isApiErrorMessage &&
+          !looksLikeCompactPromptEcho(assistantText)
+        ) {
           // Skip success logging for PTL error text — it's returned so the
           // caller's retry loop catches it, but it's not a successful summary.
           if (!assistantText.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)) {
@@ -1230,15 +1252,17 @@ async function streamCompactSummary({
           }
           return assistantMsg
         }
-        logForDebugging(
-          `Compact cache sharing: no text in response, falling back. Response: ${jsonStringify(assistantMsg)}`,
-          { level: 'warn' },
-        )
-        logEvent('tengu_compact_cache_sharing_fallback', {
-          reason:
-            'no_text_response' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-          preCompactTokenCount,
-        })
+        if (!assistantMsg || !assistantText || assistantMsg.isApiErrorMessage) {
+          logForDebugging(
+            `Compact cache sharing: no text in response, falling back. Response: ${jsonStringify(assistantMsg)}`,
+            { level: 'warn' },
+          )
+          logEvent('tengu_compact_cache_sharing_fallback', {
+            reason:
+              'no_text_response' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+            preCompactTokenCount,
+          })
+        }
       } catch (error) {
         logError(error)
         logEvent('tengu_compact_cache_sharing_fallback', {
@@ -1359,6 +1383,28 @@ async function streamCompactSummary({
       }
 
       if (response) {
+        const responseText = getAssistantMessageText(response)
+        if (responseText && looksLikeCompactPromptEcho(responseText)) {
+          if (attempt < maxAttempts) {
+            logEvent('tengu_compact_streaming_retry', {
+              attempt,
+              preCompactTokenCount,
+              hasStartedStreaming,
+              reason:
+                'prompt_echo' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+            })
+            await sleep(getRetryDelay(attempt), context.abortController.signal, {
+              abortError: () => new APIUserAbortError(),
+            })
+            continue
+          }
+
+          logForDebugging(
+            `Compact streaming returned prompt echo after ${attempt} attempts.`,
+            { level: 'warn' },
+          )
+        }
+
         return response
       }
 

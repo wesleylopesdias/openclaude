@@ -103,6 +103,7 @@ function runProcess(command: string, args: string[], env: NodeJS.ProcessEnv): Pr
       cwd: process.cwd(),
       env,
       stdio: 'inherit',
+      shell: process.platform === 'win32',
     })
 
     child.on('close', code => resolve(code ?? 1))

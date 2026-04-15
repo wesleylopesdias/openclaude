@@ -583,8 +583,10 @@ function isLocalMcpServer(config: ScopedMcpServerConfig): boolean {
   return !config.type || config.type === 'stdio' || config.type === 'sdk'
 }
 
-// For the IDE MCP servers, we only include specific tools
-const ALLOWED_IDE_TOOLS = ['mcp__ide__executeCode', 'mcp__ide__getDiagnostics']
+// For the IDE MCP servers, only expose lightweight read-only context helpers.
+// Imperative RPCs like executeCode tend to confuse local/open models and lead
+// to empty or low-signal calls instead of normal coding actions.
+const ALLOWED_IDE_TOOLS = ['mcp__ide__getDiagnostics']
 function isIncludedMcpTool(tool: Tool): boolean {
   return (
     !tool.name.startsWith('mcp__ide__') || ALLOWED_IDE_TOOLS.includes(tool.name)

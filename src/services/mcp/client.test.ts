@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { cleanupFailedConnection } from './client.js'
+import { cleanupFailedConnection, fetchToolsForClient } from './client.js'
 
 test('cleanupFailedConnection awaits transport close before resolving', async () => {
   let closed = false
@@ -45,4 +45,47 @@ test('cleanupFailedConnection closes in-process server and transport', async () 
 
   assert.equal(inProcessClosed, true)
   assert.equal(transportClosed, true)
+})
+
+test('fetchToolsForClient excludes IDE executeCode tool', async () => {
+  const client = {
+    type: 'connected',
+    name: 'ide',
+    capabilities: { tools: {} },
+    config: {
+      type: 'sse-ide',
+      url: 'http://127.0.0.1:3000',
+      ideName: 'VS Code',
+      scope: 'dynamic',
+    },
+    cleanup: async () => {},
+    client: {
+      request: async () => ({
+        tools: [
+          {
+            name: 'executeCode',
+            description: 'Execute code in the IDE',
+            inputSchema: {},
+          },
+          {
+            name: 'getDiagnostics',
+            description: 'Get IDE diagnostics',
+            inputSchema: {},
+          },
+          {
+            name: 'listFiles',
+            description: 'List project files',
+            inputSchema: {},
+          },
+        ],
+      }),
+    },
+  } as any
+
+  const tools = await fetchToolsForClient(client)
+
+  assert.deepEqual(
+    tools.map(tool => tool.name),
+    ['mcp__ide__getDiagnostics'],
+  )
 })

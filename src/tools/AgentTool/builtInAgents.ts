@@ -16,7 +16,10 @@ export function areExplorePlanAgentsEnabled(): boolean {
     // external behavior). A/B test treatment sets false to measure impact of removal.
     return getFeatureValue_CACHED_MAY_BE_STALE('tengu_amber_stoat', true)
   }
-  return false
+  // Open/local builds often omit the experiment flag entirely. In that case,
+  // keep Explore/Plan enabled by default so the built-in agent set matches
+  // the documented external behavior.
+  return true
 }
 
 export function getBuiltInAgents(): AgentDefinition[] {

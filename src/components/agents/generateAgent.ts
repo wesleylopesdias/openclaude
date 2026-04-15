@@ -23,6 +23,19 @@ type GeneratedAgent = {
   systemPrompt: string
 }
 
+const JSON_REPAIR_SUFFIXES = [
+  '}',
+  '"}',
+  ']}',
+  '"]}',
+  '}}',
+  '"}}',
+  ']}}',
+  '"]}}',
+  '"]}]}',
+  '}]}',
+]
+
 const AGENT_CREATION_SYSTEM_PROMPT = `You are an elite AI agent architect specializing in crafting high-performance agent configurations. Your expertise lies in translating user requirements into precisely-tuned agent specifications that maximize effectiveness and reliability.
 
 **Important Context**: You may have access to project-specific instructions from CLAUDE.md files and other context that may include coding standards, project structure, and custom requirements. Consider this context when creating agents to ensure they align with the project's established patterns and practices.
@@ -119,6 +132,250 @@ const AGENT_MEMORY_INSTRUCTIONS = `
    The memory instructions should be specific to what the agent would naturally learn while performing its core tasks.
 `
 
+function extractFirstJSONObject(text: string): string | null {
+  let start = -1
+  let depth = 0
+  let inString = false
+  let isEscaped = false
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (!ch) continue
+
+    if (start === -1) {
+      if (ch === '{') {
+        start = i
+        depth = 1
+      }
+      continue
+    }
+
+    if (inString) {
+      if (isEscaped) {
+        isEscaped = false
+      } else if (ch === '\\') {
+        isEscaped = true
+      } else if (ch === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+
+    if (ch === '{') {
+      depth++
+      continue
+    }
+
+    if (ch === '}') {
+      depth--
+      if (depth === 0) {
+        return text.slice(start, i + 1)
+      }
+    }
+  }
+
+  return start === -1 ? null : text.slice(start)
+}
+
+function escapeControlCharactersInJsonStrings(raw: string): string {
+  let out = ''
+  let inString = false
+  let isEscaped = false
+
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]
+    if (!ch) continue
+
+    if (inString) {
+      if (isEscaped) {
+        out += ch
+        isEscaped = false
+        continue
+      }
+
+      if (ch === '\\') {
+        out += ch
+        isEscaped = true
+        continue
+      }
+
+      if (ch === '"') {
+        out += ch
+        inString = false
+        continue
+      }
+
+      switch (ch) {
+        case '\n':
+          out += '\\n'
+          continue
+        case '\r':
+          out += '\\r'
+          continue
+        case '\t':
+          out += '\\t'
+          continue
+        case '\b':
+          out += '\\b'
+          continue
+        case '\f':
+          out += '\\f'
+          continue
+        default: {
+          const code = ch.charCodeAt(0)
+          if (code <= 0x1f) {
+            out += `\\u${code.toString(16).padStart(4, '0')}`
+            continue
+          }
+          out += ch
+          continue
+        }
+      }
+    }
+
+    if (ch === '"') {
+      inString = true
+    }
+    out += ch
+  }
+
+  return out
+}
+
+function repairPossiblyTruncatedObjectJson(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? raw
+      : null
+  } catch {
+    for (const suffix of JSON_REPAIR_SUFFIXES) {
+      try {
+        const repaired = raw + suffix
+        const parsed = JSON.parse(repaired)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return repaired
+        }
+      } catch {}
+    }
+    return null
+  }
+}
+
+function tryParseGeneratedAgentObject(raw: string): GeneratedAgent | null {
+  try {
+    const parsed = jsonParse(raw) as Partial<GeneratedAgent>
+    if (
+      typeof parsed?.identifier === 'string' &&
+      typeof parsed.whenToUse === 'string' &&
+      typeof parsed.systemPrompt === 'string'
+    ) {
+      return {
+        identifier: parsed.identifier.trim(),
+        whenToUse: parsed.whenToUse,
+        systemPrompt: parsed.systemPrompt,
+      }
+    }
+  } catch {}
+
+  return null
+}
+
+function decodeLooseJsonString(raw: string): string {
+  return raw
+    .replace(/\r\n/g, '\n')
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) =>
+      String.fromCharCode(parseInt(hex, 16)),
+    )
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\b/g, '\b')
+    .replace(/\\f/g, '\f')
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, '\\')
+    .replace(/\\\//g, '/')
+}
+
+function tryExtractGeneratedAgentFields(raw: string): GeneratedAgent | null {
+  const identifierMatch = raw.match(
+    /"identifier"\s*:\s*"([\s\S]*?)"\s*,\s*"whenToUse"\s*:/,
+  )
+  const whenToUseMatch = raw.match(
+    /"whenToUse"\s*:\s*"([\s\S]*?)"\s*,\s*"systemPrompt"\s*:/,
+  )
+  const systemPromptMatch = raw.match(
+    /"systemPrompt"\s*:\s*"([\s\S]*?)"\s*}\s*$/,
+  )
+
+  const identifier = identifierMatch?.[1]?.trim()
+  const whenToUse = whenToUseMatch?.[1]
+  const systemPrompt = systemPromptMatch?.[1]
+
+  if (!identifier || whenToUse === undefined || systemPrompt === undefined) {
+    return null
+  }
+
+  return {
+    identifier: decodeLooseJsonString(identifier).trim(),
+    whenToUse: decodeLooseJsonString(whenToUse),
+    systemPrompt: decodeLooseJsonString(systemPrompt),
+  }
+}
+
+export function parseGeneratedAgentResponse(responseText: string): GeneratedAgent {
+  const trimmed = responseText.trim()
+  const extracted = extractFirstJSONObject(trimmed)
+  const candidates = new Set<string>()
+
+  if (trimmed) {
+    candidates.add(trimmed)
+  }
+  if (extracted) {
+    candidates.add(extracted.trim())
+  }
+
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim()
+  if (fenced) {
+    candidates.add(fenced)
+  }
+
+  for (const candidate of candidates) {
+    if (!candidate) continue
+
+    const escapedControls = escapeControlCharactersInJsonStrings(candidate)
+    const repairedVariants = [
+      candidate,
+      escapedControls,
+      repairPossiblyTruncatedObjectJson(candidate),
+      repairPossiblyTruncatedObjectJson(escapedControls),
+    ].filter((value): value is string => Boolean(value))
+
+    for (const variant of repairedVariants) {
+      const parsed = tryParseGeneratedAgentObject(variant)
+      if (parsed) {
+        return parsed
+      }
+    }
+
+    const looseParsed =
+      tryExtractGeneratedAgentFields(candidate) ??
+      tryExtractGeneratedAgentFields(escapedControls)
+    if (looseParsed) {
+      return looseParsed
+    }
+  }
+
+  throw new Error(
+    'Failed to parse generated agent. The model returned malformed JSON.',
+  )
+}
+
 export async function generateAgent(
   userPrompt: string,
   model: ModelName,
@@ -131,7 +388,8 @@ export async function generateAgent(
       : ''
 
   const prompt = `Create an agent configuration based on this request: "${userPrompt}".${existingList}
-  Return ONLY the JSON object, no other text.`
+  Return ONLY the JSON object, no other text.
+  IMPORTANT: escape every newline inside JSON string values as \\n, and escape inner double quotes.`
 
   const userMessage = createUserMessage({ content: prompt })
 
@@ -169,16 +427,7 @@ export async function generateAgent(
   )
   const responseText = textBlocks.map(block => block.text).join('\n')
 
-  let parsed: GeneratedAgent
-  try {
-    parsed = jsonParse(responseText.trim())
-  } catch {
-    const jsonMatch = responseText.match(/\{[\s\S]*\}/)
-    if (!jsonMatch) {
-      throw new Error('No JSON object found in response')
-    }
-    parsed = jsonParse(jsonMatch[0])
-  }
+  const parsed = parseGeneratedAgentResponse(responseText)
 
   if (!parsed.identifier || !parsed.whenToUse || !parsed.systemPrompt) {
     throw new Error('Invalid agent configuration generated')

@@ -1,6 +1,7 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
+    "target": "ES2023",
+    "lib": ["ES2024"],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "jsx": "react-jsx",
@@ -9,10 +10,13 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
     "declaration": false,
+    "noEmit": true,
     "outDir": "./dist",
     "rootDir": "./src",
     "baseUrl": ".",
+    "types": ["node", "bun"],
     "paths": {
       "src/*": ["./src/*"]
     }
